@@ -272,9 +272,14 @@
 
   const CORE_SUBJECTS = ["English", "Urdu", "Maths"];
 
+  // آف لائن اور ڈیفالٹ ویلیوز
+  if (!localStorage.getItem("sms_adminUser")) localStorage.setItem("sms_adminUser", "admin");
+  if (!localStorage.getItem("sms_adminPass")) localStorage.setItem("sms_adminPass", "shifa123");
+  if (!localStorage.getItem("sms_teacherPass")) localStorage.setItem("sms_teacherPass", "staff2026");
   if (!localStorage.getItem("sms_schoolName")) localStorage.setItem("sms_schoolName", DEFAULT_SCHOOL_NAME);
   if (!localStorage.getItem("sms_schoolLogo")) localStorage.setItem("sms_schoolLogo", DEFAULT_LOGO);
   if (!localStorage.getItem("sms_classSubjects")) localStorage.setItem("sms_classSubjects", JSON.stringify({}));
+  if (!localStorage.getItem("sms_all_diaries")) localStorage.setItem("sms_all_diaries", JSON.stringify([]));
 
   let tempLogoBase64 = null;
   let currentAdminUser = "";
@@ -282,8 +287,50 @@
   let isEditOverwriteMode = false;
   let cachedDateDiaries = [];
 
-  function hasScriptUrl() {
-    return SCRIPT_URL && !SCRIPT_URL.includes("YOUR_GOOGLE_APPS_SCRIPT_WEB_APP_URL_HERE");
+  function getLocalDiariesByDate(date) {
+    const all = JSON.parse(localStorage.getItem("sms_all_diaries") || "[]");
+    return all.filter(d => d.date === date);
+  }
+
+  function saveLocalDiaryRecord(record, overwrite) {
+    let all = JSON.parse(localStorage.getItem("sms_all_diaries") || "[]");
+    const idx = all.findIndex(d => d.date === record.date && d.className === record.className && d.section === record.section);
+    if (idx > -1) {
+      if (overwrite) {
+        all[idx] = record;
+      } else {
+        let merged = [...(all[idx].entries || [])];
+        (record.entries || []).forEach(ne => {
+          const sIdx = merged.findIndex(m => m.subject.toLowerCase() === ne.subject.toLowerCase());
+          if (sIdx > -1) {
+            if (ne.homework && ne.homework !== "Empty") merged[sIdx].homework = ne.homework;
+          } else {
+            merged.push(ne);
+          }
+        });
+        all[idx].entries = merged;
+        if (record.generalMsg !== undefined) all[idx].generalMsg = record.generalMsg;
+      }
+    } else {
+      all.push(record);
+    }
+    localStorage.setItem("sms_all_diaries", JSON.stringify(all));
+    return getLocalDiariesByDate(record.date);
+  }
+
+  function replaceLocalDiariesForDate(date, remoteList) {
+    let all = JSON.parse(localStorage.getItem("sms_all_diaries") || "[]");
+    all = all.filter(d => d.date !== date).concat(remoteList);
+    localStorage.setItem("sms_all_diaries", JSON.stringify(all));
+  }
+
+  async function postToScript(payload) {
+    const res = await fetch(SCRIPT_URL, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify(payload)
+    });
+    return await res.json();
   }
 
   function applySchoolBranding() {
@@ -323,24 +370,30 @@
   }
 
   async function fetchRemoteConfig() {
-    if (!hasScriptUrl()) return;
     try {
       const res = await fetch(SCRIPT_URL + "?action=getConfig");
       const cfg = await res.json();
       if (cfg.schoolName) localStorage.setItem("sms_schoolName", cfg.schoolName);
       if (cfg.classSubjects) localStorage.setItem("sms_classSubjects", JSON.stringify(cfg.classSubjects));
       applySchoolBranding();
-    } catch (e) {}
+    } catch (e) {
+      // آف لائن ہونے پر لوکل برانڈنگ برقرار رہے گی
+    }
   }
 
   async function fetchRemoteDiariesByDate(date) {
-    if (!hasScriptUrl()) {
-      return JSON.parse(localStorage.getItem("sms_diaries_cache_" + date) || "[]");
+    try {
+      const res = await fetch(SCRIPT_URL + "?date=" + encodeURIComponent(date));
+      const list = await res.json();
+      if (Array.isArray(list)) {
+        cachedDateDiaries = list;
+        replaceLocalDiariesForDate(date, list);
+        return cachedDateDiaries;
+      }
+    } catch (e) {
+      // آف لائن ہونے پر لوکل محفوظ شدہ ڈائری استعمال ہوگی
     }
-    const res = await fetch(SCRIPT_URL + "?date=" + encodeURIComponent(date));
-    const list = await res.json();
-    cachedDateDiaries = Array.isArray(list) ? list : [];
-    localStorage.setItem("sms_diaries_cache_" + date, JSON.stringify(cachedDateDiaries));
+    cachedDateDiaries = getLocalDiariesByDate(date);
     return cachedDateDiaries;
   }
 
@@ -365,7 +418,7 @@
     const date = document.getElementById("tDate").value;
     const className = document.getElementById("tClass").value;
     const section = document.getElementById("tSection").value;
-    const list = cachedDateDiaries.length ? cachedDateDiaries : JSON.parse(localStorage.getItem("sms_diaries_cache_" + date) || "[]");
+    const list = cachedDateDiaries.length ? cachedDateDiaries : getLocalDiariesByDate(date);
     return list.find(d => d.date === date && d.className === className && d.section === section) || null;
   }
 
@@ -393,6 +446,8 @@
   async function syncAndRefreshTeacherView() {
     const date = document.getElementById("tDate").value;
     const className = document.getElementById("tClass").value;
+    cachedDateDiaries = getLocalDiariesByDate(date);
+    populateTeacherSubjectRows(className, getExistingRecordForCurrentSelection());
     await fetchRemoteDiariesByDate(date);
     populateTeacherSubjectRows(className, getExistingRecordForCurrentSelection());
   }
@@ -400,6 +455,7 @@
   applySchoolBranding();
   document.getElementById("tDate").valueAsDate = new Date();
   document.getElementById("aDate").valueAsDate = new Date();
+  syncAndRefreshTeacherView();
   fetchRemoteConfig().then(() => syncAndRefreshTeacherView());
 
   window.addEventListener("focus", () => {
@@ -435,15 +491,10 @@
   }
 
   async function submitDiary() {
-    if (!hasScriptUrl()) {
-      alert("براہ کرم کوڈ میں SCRIPT_URL کی جگہ اپنا Google Apps Script Web App لنک ڈالیں۔");
-      return;
-    }
-
     const date = document.getElementById("tDate").value;
     const className = document.getElementById("tClass").value;
     const section = document.getElementById("tSection").value;
-    const teacherPass = document.getElementById("tPass").value;
+    const teacherPass = document.getElementById("tPass").value.trim();
     const msg = document.getElementById("tMsg");
     const btn = document.getElementById("tSubmitBtn");
 
@@ -464,41 +515,58 @@
       alert("براہ کرم کم از کم ایک مضمون کا ہوم ورک لکھیں!");
       return;
     }
-    if (!teacherPass.trim()) {
+    if (!teacherPass) {
       alert("براہ کرم ٹیچر پاسورڈ درج کریں!");
       return;
     }
 
     btn.disabled = true;
-    btn.innerText = "محفوظ اور ریفریش ہو رہا ہے...";
+    btn.innerText = "محفوظ ہو رہا ہے...";
     msg.innerText = "";
 
+    const localPass = localStorage.getItem("sms_teacherPass") || "staff2026";
+    const recordObj = {
+      date: date,
+      className: className,
+      section: section,
+      entries: submittedEntries,
+      generalMsg: ""
+    };
+
     try {
-      const res = await fetch(SCRIPT_URL, {
-        method: "POST",
-        body: JSON.stringify({
-          date: date,
-          className: className,
-          section: section,
-          teacherPass: teacherPass,
-          entries: submittedEntries,
-          overwrite: isEditOverwriteMode
-        })
+      const result = await postToScript({
+        date: date,
+        className: className,
+        section: section,
+        teacherPass: teacherPass,
+        entries: submittedEntries,
+        overwrite: isEditOverwriteMode
       });
-      const result = await res.json();
+
       if (result.status === "success") {
+        localStorage.setItem("sms_teacherPass", teacherPass);
+        cachedDateDiaries = saveLocalDiaryRecord(recordObj, isEditOverwriteMode);
         isEditOverwriteMode = false;
         await fetchRemoteDiariesByDate(date);
         populateTeacherSubjectRows(className, getExistingRecordForCurrentSelection());
         msg.style.color = "green";
-        msg.innerText = `✅ ${className} (${section}) کی ڈائری محفوظ ہو گئی اور پیج ریفریش ہو گیا!`;
+        msg.innerText = `✅ ${className} (${section}) کی ڈائری گوگل شیٹ میں محفوظ ہو گئی اور پیج ریفریش ہو گیا!`;
       } else {
         msg.style.color = "red";
-        msg.innerText = result.message || "❌ غلط پاسورڈ!";
+        msg.innerText = result.message || "❌ غلط ٹیچر پاسورڈ!";
       }
     } catch (err) {
-      msg.style.color = "red";
-      msg.innerText = "❌ سرور سے رابطے میں مسئلہ آیا، دوبارہ کوشش کریں۔";
+      // اگر انٹرنیٹ نہ ہو یا سرور سے رابطہ نہ ہو سکے تو آف لائن محفوظ کریں
+      if (teacherPass === localPass) {
+        cachedDateDiaries = saveLocalDiaryRecord(recordObj, isEditOverwriteMode);
+        isEditOverwriteMode = false;
+        populateTeacherSubjectRows(className, getExistingRecordForCurrentSelection());
+        msg.style.color = "#e65100";
+        msg.innerText = `✅ آف لائن محفوظ ہو گیا! (انٹرنیٹ/گوگل شیٹ کنکشن دستیاب نہ ہونے کی وجہ سے ابھی اس ڈیوائس میں محفوظ ہوا ہے)`;
+      } else {
+        msg.style.color = "red";
+        msg.innerText = "❌ غلط پاسورڈ (آف لائن موڈ)!";
+      }
     } finally {
       btn.disabled = false;
       btn.innerText = "ڈائری محفوظ کریں (Save Subject Diary)";
@@ -506,11 +574,6 @@
   }
 
   async function adminLogin() {
-    if (!hasScriptUrl()) {
-      alert("براہ کرم پہلے SCRIPT_URL سیٹ کریں۔");
-      return;
-    }
-
     const user = document.getElementById("loginUser").value.trim();
     const pass = document.getElementById("loginPass").value.trim();
     const loginMsg = document.getElementById("loginMsg");
@@ -526,27 +589,40 @@
     loginMsg.innerText = "";
 
     try {
-      const res = await fetch(SCRIPT_URL, {
-        method: "POST",
-        body: JSON.stringify({ action: "adminAuth", adminUser: user, adminPass: pass })
-      });
-      const data = await res.json();
+      const data = await postToScript({ action: "adminAuth", adminUser: user, adminPass: pass });
       if (data.status === "success") {
         currentAdminUser = user;
         currentAdminPass = pass;
+        localStorage.setItem("sms_adminUser", user);
+        localStorage.setItem("sms_adminPass", pass);
+        if (data.teacherPass) localStorage.setItem("sms_teacherPass", data.teacherPass);
         if (data.schoolName) localStorage.setItem("sms_schoolName", data.schoolName);
         if (data.classSubjects) localStorage.setItem("sms_classSubjects", JSON.stringify(data.classSubjects));
         applySchoolBranding();
-        document.getElementById("newTeacherPass").value = data.teacherPass || "";
+        document.getElementById("newTeacherPass").value = data.teacherPass || localStorage.getItem("sms_teacherPass");
+        document.getElementById("adminLoginSection").classList.add("hidden");
+        document.getElementById("adminDashboardSection").classList.remove("hidden");
+        loadClassDefaultSubjectsInput();
+        loadDiaries();
+        return;
+      } else {
+        loginMsg.innerText = data.message || "❌ غلط یوزر نیم یا پاسورڈ!";
+      }
+    } catch (err) {
+      // آف لائن لاگ ان بیک اپ
+      const savedUser = localStorage.getItem("sms_adminUser") || "admin";
+      const savedPass = localStorage.getItem("sms_adminPass") || "shifa123";
+      if (user === savedUser && pass === savedPass) {
+        currentAdminUser = user;
+        currentAdminPass = pass;
+        document.getElementById("newTeacherPass").value = localStorage.getItem("sms_teacherPass") || "staff2026";
         document.getElementById("adminLoginSection").classList.add("hidden");
         document.getElementById("adminDashboardSection").classList.remove("hidden");
         loadClassDefaultSubjectsInput();
         loadDiaries();
       } else {
-        loginMsg.innerText = data.message || "❌ غلط لاگ ان!";
+        loginMsg.innerText = "❌ غلط یوزر نیم یا پاسورڈ!";
       }
-    } catch (err) {
-      loginMsg.innerText = "❌ سرور سے رابطہ نہیں ہو سکا۔";
     } finally {
       btn.disabled = false;
       btn.innerText = "لاگ ان کریں (Login)";
@@ -575,19 +651,16 @@
     map[cls] = parsed;
     localStorage.setItem("sms_classSubjects", JSON.stringify(map));
 
-    const msg = document.getElementById("defSubMsg");
-    if (hasScriptUrl() && currentAdminUser && currentAdminPass) {
-      await fetch(SCRIPT_URL, {
-        method: "POST",
-        body: JSON.stringify({
-          action: "saveAdminSettings",
-          adminUser: currentAdminUser,
-          currentAdminPass: currentAdminPass,
-          classSubjectsJSON: JSON.stringify(map)
-        })
+    try {
+      await postToScript({
+        action: "saveAdminSettings",
+        adminUser: currentAdminUser,
+        currentAdminPass: currentAdminPass,
+        classSubjectsJSON: JSON.stringify(map)
       });
-    }
+    } catch (e) {}
 
+    const msg = document.getElementById("defSubMsg");
     msg.style.color = "green";
     msg.innerText = `✅ ${cls} کے Default مضامین محفوظ ہو گئے!`;
     if (document.getElementById("tClass").value === cls) {
@@ -599,22 +672,20 @@
     const item = cachedDateDiaries.find(d => encodeURIComponent(d.date + "::" + d.className + "::" + d.section) === encodedKey);
     if (!item) return;
     item.generalMsg = value;
+    saveLocalDiaryRecord(item, true);
     refreshShareLinksOnly();
 
-    if (hasScriptUrl() && currentAdminUser && currentAdminPass) {
-      await fetch(SCRIPT_URL, {
-        method: "POST",
-        body: JSON.stringify({
-          action: "updateNote",
-          adminUser: currentAdminUser,
-          adminPass: currentAdminPass,
-          date: item.date,
-          className: item.className,
-          section: item.section,
-          generalMsg: value
-        })
+    try {
+      await postToScript({
+        action: "updateNote",
+        adminUser: currentAdminUser,
+        adminPass: currentAdminPass,
+        date: item.date,
+        className: item.className,
+        section: item.section,
+        generalMsg: value
       });
-    }
+    } catch (e) {}
   }
 
   async function applyDiaryToSelectedSections(encodedKey) {
@@ -630,20 +701,21 @@
     for (const chk of checkboxes) {
       const targetSec = chk.value;
       if (targetSec === source.section) continue;
-      if (hasScriptUrl()) {
-        await fetch(SCRIPT_URL, {
-          method: "POST",
-          body: JSON.stringify({
-            date: source.date,
-            className: source.className,
-            section: targetSec,
-            teacherPass: document.getElementById("newTeacherPass").value || "staff2026",
-            entries: source.entries || [],
-            generalMsg: source.generalMsg || "",
-            overwrite: true
-          })
+      const copyRec = {
+        date: source.date,
+        className: source.className,
+        section: targetSec,
+        entries: source.entries || [],
+        generalMsg: source.generalMsg || ""
+      };
+      saveLocalDiaryRecord(copyRec, true);
+      try {
+        await postToScript({
+          ...copyRec,
+          teacherPass: localStorage.getItem("sms_teacherPass") || "staff2026",
+          overwrite: true
         });
-      }
+      } catch (e) {}
     }
 
     await loadDiaries();
@@ -797,19 +869,20 @@
     const item = cachedDateDiaries.find(d => encodeURIComponent(d.date + "::" + d.className + "::" + d.section) === encKey);
     if (!item || !confirm("کیا آپ واقعی یہ ڈائری حذف کرنا چاہتے ہیں؟")) return;
 
-    if (hasScriptUrl() && currentAdminUser && currentAdminPass) {
-      await fetch(SCRIPT_URL, {
-        method: "POST",
-        body: JSON.stringify({
-          action: "deleteDiary",
-          adminUser: currentAdminUser,
-          adminPass: currentAdminPass,
-          date: item.date,
-          className: item.className,
-          section: item.section
-        })
+    let all = JSON.parse(localStorage.getItem("sms_all_diaries") || "[]");
+    all = all.filter(d => !(d.date === item.date && d.className === item.className && d.section === item.section));
+    localStorage.setItem("sms_all_diaries", JSON.stringify(all));
+
+    try {
+      await postToScript({
+        action: "deleteDiary",
+        adminUser: currentAdminUser,
+        adminPass: currentAdminPass,
+        date: item.date,
+        className: item.className,
+        section: item.section
       });
-    }
+    } catch (e) {}
     await loadDiaries();
   }
 
@@ -835,28 +908,26 @@
       localStorage.setItem("sms_schoolLogo", tempLogoBase64);
       tempLogoBase64 = null;
     }
+    if (newTeacherPass) localStorage.setItem("sms_teacherPass", newTeacherPass);
+    if (newAdminUser) localStorage.setItem("sms_adminUser", newAdminUser);
+    if (newAdminPass) localStorage.setItem("sms_adminPass", newAdminPass);
     applySchoolBranding();
 
-    if (hasScriptUrl() && currentAdminUser && currentAdminPass) {
-      const res = await fetch(SCRIPT_URL, {
-        method: "POST",
-        body: JSON.stringify({
-          action: "saveAdminSettings",
-          adminUser: currentAdminUser,
-          currentAdminPass: currentAdminPass,
-          schoolName: newSchoolName || localStorage.getItem("sms_schoolName"),
-          newTeacherPass: newTeacherPass,
-          newAdminUser: newAdminUser,
-          newAdminPass: newAdminPass
-        })
+    try {
+      const out = await postToScript({
+        action: "saveAdminSettings",
+        adminUser: currentAdminUser,
+        currentAdminPass: currentAdminPass,
+        schoolName: newSchoolName || localStorage.getItem("sms_schoolName"),
+        newTeacherPass: newTeacherPass,
+        newAdminUser: newAdminUser,
+        newAdminPass: newAdminPass
       });
-      const out = await res.json();
-      if (out.status === "success" && newAdminPass) {
-        currentAdminPass = newAdminPass;
-      }
-      if (out.status === "success" && newAdminUser) {
-        currentAdminUser = newAdminUser;
-      }
+      if (out.status === "success" && newAdminPass) currentAdminPass = newAdminPass;
+      if (out.status === "success" && newAdminUser) currentAdminUser = newAdminUser;
+    } catch (e) {
+      if (newAdminPass) currentAdminPass = newAdminPass;
+      if (newAdminUser) currentAdminUser = newAdminUser;
     }
 
     refreshShareLinksOnly();
